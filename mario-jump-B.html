@@ -1,0 +1,454 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>First-Person Jump Game</title>
+<style>
+  body { margin: 0; min-height: 100vh; display: flex; flex-direction: column; align-items: center; justify-content: center; background: #222; font-family: sans-serif; color: #eee; }
+  canvas { max-width: 100%; height: auto; border: 4px solid #000; background: #5c94fc; }
+  p { font-size: 14px; text-align: center; padding: 0 16px; }
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+<p>W / ↑ / D / → 앞으로 · S / ↓ / A / ← 뒤로 · Space 점프 · 적을 위에서 밟기 · 깃발에 닿으면 클리어 · R 다시 시작</p>
+<script>
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+const W = 800;
+const H = 450;
+
+// Render at device pixel ratio so the image stays sharp on retina screens
+const dpr = window.devicePixelRatio || 1;
+canvas.width = W * dpr;
+canvas.height = H * dpr;
+ctx.scale(dpr, dpr);
+
+const GRAVITY = 0.6;
+const JUMP_POWER = -12;
+const MOVE_SPEED = 4;
+const WORLD_WIDTH = 2450;
+const FLOOR_Y = 400;
+
+// First-person camera: looks along +x from the player's eyes
+const FOCAL = 300;
+const NEAR = 30;
+const FAR = 900;
+const LANE = 90;
+const HORIZON = H * 0.42;
+
+// SFX-BEGIN (this block is also read by render-sfx.js to render 32-bit float WAV files)
+const SFX_MASTER = 0.3;
+
+// Icy, bell-like timbres built from sine partials: [frequency ratio, amplitude]
+const SFX_INSTRUMENTS = {
+  bell: { partials: [[1, 1], [2.76, 0.5], [5.4, 0.25]], decay: 0.5 },
+  celesta: { partials: [[1, 1], [2, 0.35], [4, 0.12]], decay: 0.3 },
+  bass: { partials: [[1, 1], [2, 0.3]], decay: 0.15 },
+};
+
+// MIDI-style note events: n = note number, t = start (s), d = length (s), v = velocity, i = instrument
+const SFX = {
+  jump: [
+    { n: 79, t: 0, d: 0.06, v: 0.6, i: 'celesta' },
+    { n: 86, t: 0.06, d: 0.12, v: 0.6, i: 'celesta' },
+  ],
+  stomp: [
+    { n: 43, t: 0, d: 0.1, v: 0.9, i: 'bass' },
+    { n: 91, t: 0.02, d: 0.1, v: 0.5, i: 'bell' },
+  ],
+  die: [
+    { n: 76, t: 0, d: 0.12, v: 0.7, i: 'celesta' },
+    { n: 72, t: 0.14, d: 0.12, v: 0.7, i: 'celesta' },
+    { n: 69, t: 0.28, d: 0.12, v: 0.7, i: 'celesta' },
+    { n: 64, t: 0.42, d: 0.3, v: 0.7, i: 'bell' },
+    { n: 40, t: 0.42, d: 0.3, v: 0.8, i: 'bass' },
+  ],
+  fall: Array.from({ length: 8 }, (_, k) => ({ n: 88 - k * 3, t: k * 0.05, d: 0.06, v: 0.5, i: 'celesta' })),
+  clear: [
+    { n: 72, t: 0, d: 0.12, v: 0.7, i: 'celesta' },
+    { n: 76, t: 0.12, d: 0.12, v: 0.7, i: 'celesta' },
+    { n: 79, t: 0.24, d: 0.12, v: 0.7, i: 'celesta' },
+    { n: 84, t: 0.36, d: 0.5, v: 0.8, i: 'bell' },
+    { n: 88, t: 0.36, d: 0.5, v: 0.6, i: 'celesta' },
+    { n: 91, t: 0.36, d: 0.5, v: 0.6, i: 'celesta' },
+    { n: 48, t: 0.36, d: 0.5, v: 0.8, i: 'bass' },
+  ],
+};
+
+function midiToHz(n) {
+  return 440 * Math.pow(2, (n - 69) / 12);
+}
+
+function noteLength(note) {
+  return note.d + SFX_INSTRUMENTS[note.i].decay;
+}
+
+// Amplitude envelope: 5ms linear attack, then an exponential decay down to 0.0001
+function envelope(peak, length, lt) {
+  if (lt < 0 || lt >= length) return 0;
+  if (lt < 0.005) return peak * lt / 0.005;
+  return peak * Math.pow(0.0001 / peak, (lt - 0.005) / (length - 0.005));
+}
+// SFX-END
+
+let audioCtx = null;
+
+function initAudio() {
+  if (audioCtx) return;
+  try {
+    audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  } catch (err) {
+    audioCtx = null;
+  }
+}
+
+function playSfx(name) {
+  if (!audioCtx) return;
+  if (audioCtx.state === 'suspended') audioCtx.resume();
+  const now = audioCtx.currentTime;
+  for (const note of SFX[name]) {
+    const inst = SFX_INSTRUMENTS[note.i];
+    const start = now + note.t;
+    const end = start + noteLength(note);
+    const total = inst.partials.reduce((sum, [, amp]) => sum + amp, 0);
+    for (const [ratio, amp] of inst.partials) {
+      const peak = note.v * SFX_MASTER * amp / total;
+      const osc = audioCtx.createOscillator();
+      const gain = audioCtx.createGain();
+      osc.type = 'sine';
+      osc.frequency.value = midiToHz(note.n) * ratio;
+      gain.gain.setValueAtTime(0, start);
+      gain.gain.linearRampToValueAtTime(peak, start + 0.005);
+      gain.gain.exponentialRampToValueAtTime(0.0001, end);
+      osc.connect(gain).connect(audioCtx.destination);
+      osc.start(start);
+      osc.stop(end);
+    }
+  }
+}
+
+const keys = {};
+addEventListener('keydown', e => {
+  initAudio();
+  keys[e.code] = true;
+  if (['Space', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight'].includes(e.code)) e.preventDefault();
+});
+addEventListener('keyup', e => { keys[e.code] = false; });
+
+const platforms = [
+  { x: 0, y: FLOOR_Y, w: 600, h: 50 },
+  { x: 680, y: FLOOR_Y, w: 500, h: 50 },
+  { x: 1260, y: FLOOR_Y, w: 400, h: 50 },
+  { x: 1750, y: FLOOR_Y, w: 700, h: 50 },
+  { x: 330, y: 320, w: 120, h: 20 },
+  { x: 800, y: 300, w: 140, h: 20 },
+  { x: 1040, y: 340, w: 100, h: 20 },
+  { x: 1460, y: 300, w: 150, h: 20 },
+  { x: 1900, y: 330, w: 120, h: 20 },
+];
+const flag = { x: 2360, top: 300 };
+
+// Enemies patrol between min and max; they are not affected by gravity.
+function makeEnemies() {
+  return [
+    { x: 300, y: 368, w: 28, h: 32, dir: -1, min: 150, max: 560, alive: true },
+    { x: 900, y: 268, w: 28, h: 32, dir: 1, min: 800, max: 912, alive: true },
+    { x: 1800, y: 368, w: 28, h: 32, dir: 1, min: 1760, max: 2050, alive: true },
+    { x: 1500, y: 268, w: 28, h: 32, dir: -1, min: 1460, max: 1580, alive: true },
+  ];
+}
+
+// Floating monsters bob up and down and drift toward the player when near.
+function makeMonsters() {
+  return [
+    { x: 600, y: 180, baseY: 180, w: 36, h: 36, t: 0 },
+    { x: 1350, y: 150, baseY: 150, w: 36, h: 36, t: 2 },
+    { x: 2050, y: 200, baseY: 200, w: 36, h: 36, t: 4 },
+  ];
+}
+
+let player, enemies, monsters, won;
+let eyeX = 0;
+let eyeY = 0;
+
+function reset() {
+  player = { x: 40, y: FLOOR_Y - 32, w: 28, h: 32, vx: 0, vy: 0, onGround: false };
+  enemies = makeEnemies();
+  monsters = makeMonsters();
+  won = false;
+}
+
+function hit(a, b) {
+  return a.x < b.x + b.w && a.x + a.w > b.x && a.y < b.y + b.h && a.y + a.h > b.y;
+}
+
+function update() {
+  if (keys.KeyR) { reset(); return; }
+  if (won) return;
+
+  const forward = keys.ArrowUp || keys.KeyW || keys.ArrowRight || keys.KeyD;
+  const back = keys.ArrowDown || keys.KeyS || keys.ArrowLeft || keys.KeyA;
+  const jump = keys.Space;
+  const p = player;
+
+  p.vx = ((forward ? 1 : 0) - (back ? 1 : 0)) * MOVE_SPEED;
+  if (jump && p.onGround) { p.vy = JUMP_POWER; p.onGround = false; playSfx('jump'); }
+  p.vy = Math.min(p.vy + GRAVITY, 14);
+
+  // Horizontal move, then resolve against platform sides
+  p.x = Math.max(0, Math.min(WORLD_WIDTH - p.w, p.x + p.vx));
+  for (const s of platforms) {
+    if (!hit(p, s)) continue;
+    if (p.vx > 0) p.x = s.x - p.w;
+    else if (p.vx < 0) p.x = s.x + s.w;
+  }
+
+  // Vertical move, then resolve against platform tops and bottoms
+  p.y += p.vy;
+  p.onGround = false;
+  for (const s of platforms) {
+    if (!hit(p, s)) continue;
+    if (p.vy > 0) { p.y = s.y - p.h; p.onGround = true; }
+    else if (p.vy < 0) p.y = s.y + s.h;
+    p.vy = 0;
+  }
+
+  if (p.y > H + 100) { playSfx('fall'); reset(); return; }
+
+  for (const e of enemies) {
+    if (!e.alive) continue;
+    e.x += e.dir * 1.2;
+    if (e.x < e.min || e.x > e.max) e.dir *= -1;
+    if (!hit(p, e)) continue;
+    const wasAbove = p.y + p.h - p.vy <= e.y + 6;
+    if (p.vy > 0 && wasAbove) {
+      e.alive = false;
+      p.vy = JUMP_POWER * 0.6;
+      playSfx('stomp');
+    } else {
+      playSfx('die');
+      reset();
+      return;
+    }
+  }
+
+  for (const m of monsters) {
+    m.t += 0.05;
+    m.y = m.baseY + Math.sin(m.t) * 30;
+    if (Math.abs(p.x - m.x) < 320) m.x += Math.sign(p.x - m.x) * 0.9;
+    if (hit(p, m)) { playSfx('die'); reset(); return; }
+  }
+
+  if (p.x + p.w > flag.x) {
+    won = true;
+    playSfx('clear');
+  }
+}
+
+// Perspective projection: z is the sideways offset, d the distance ahead, y the world height
+function project(z, d, y) {
+  const s = FOCAL / d;
+  return [W / 2 + z * s, HORIZON + (y - eyeY) * s];
+}
+
+function fillQuad(a, b, c, d) {
+  ctx.beginPath();
+  ctx.moveTo(a[0], a[1]);
+  ctx.lineTo(b[0], b[1]);
+  ctx.lineTo(c[0], c[1]);
+  ctx.lineTo(d[0], d[1]);
+  ctx.closePath();
+  ctx.fill();
+}
+
+function drawSlab(s) {
+  const dn = Math.max(s.x - eyeX, NEAR);
+  const df = Math.min(s.x + s.w - eyeX, FAR);
+  if (df <= dn) return;
+
+  // Top surface when seen from above, underside when seen from below
+  const fromAbove = eyeY <= s.y;
+  const surfY = fromAbove ? s.y : s.y + s.h;
+  ctx.fillStyle = fromAbove ? '#4cc24c' : '#7a3410';
+  fillQuad(
+    project(-LANE, dn, surfY), project(LANE, dn, surfY),
+    project(LANE, df, surfY), project(-LANE, df, surfY)
+  );
+
+  // Cross lines every 50 units give a sense of speed
+  ctx.strokeStyle = 'rgba(0, 0, 0, 0.25)';
+  ctx.lineWidth = 2;
+  for (let wx = Math.ceil((eyeX + dn) / 50) * 50; wx < eyeX + df; wx += 50) {
+    const [lx, ly] = project(-LANE, wx - eyeX, surfY);
+    const [rx, ry] = project(LANE, wx - eyeX, surfY);
+    ctx.beginPath();
+    ctx.moveTo(lx, ly);
+    ctx.lineTo(rx, ry);
+    ctx.stroke();
+  }
+
+  // Brick front face of a platform that is still ahead of us
+  const dFront = s.x - eyeX;
+  if (dFront > NEAR && dFront < FAR) {
+    const [lx, ty] = project(-LANE, dFront, s.y);
+    const [rx, by] = project(LANE, dFront, s.y + s.h);
+    ctx.fillStyle = '#c84c0c';
+    ctx.fillRect(lx, ty, rx - lx, by - ty);
+  }
+}
+
+// Draws a 2D sprite as a billboard scaled by its distance from the camera
+function drawSprite(o, w, drawFn) {
+  const d = o.x + w / 2 - eyeX;
+  if (d < NEAR || d > FAR) return;
+  const s = FOCAL / d;
+  ctx.save();
+  ctx.translate(W / 2 - (w / 2) * s, HORIZON + (o.y - eyeY) * s);
+  ctx.scale(s, s);
+  drawFn({ x: 0, y: 0, t: o.t });
+  ctx.restore();
+}
+
+function drawGoomba(e) {
+  // Body
+  ctx.fillStyle = '#8b4a1e';
+  ctx.beginPath();
+  ctx.ellipse(e.x + 14, e.y + 14, 14, 14, 0, 0, Math.PI * 2);
+  ctx.fill();
+
+  // Lighter lower face
+  ctx.fillStyle = '#f3d9a4';
+  ctx.beginPath();
+  ctx.ellipse(e.x + 14, e.y + 22, 10, 6, 0, 0, Math.PI * 2);
+  ctx.fill();
+
+  // Eyes with angry brows
+  ctx.fillStyle = '#fff';
+  ctx.fillRect(e.x + 6, e.y + 9, 6, 7);
+  ctx.fillRect(e.x + 16, e.y + 9, 6, 7);
+  ctx.fillStyle = '#000';
+  ctx.fillRect(e.x + 8, e.y + 11, 3, 4);
+  ctx.fillRect(e.x + 18, e.y + 11, 3, 4);
+  ctx.strokeStyle = '#000';
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.moveTo(e.x + 5, e.y + 7);
+  ctx.lineTo(e.x + 12, e.y + 9);
+  ctx.moveTo(e.x + 23, e.y + 7);
+  ctx.lineTo(e.x + 16, e.y + 9);
+  ctx.stroke();
+
+  // Feet
+  ctx.fillStyle = '#3a1f0a';
+  ctx.fillRect(e.x + 2, e.y + 26, 10, 6);
+  ctx.fillRect(e.x + 16, e.y + 26, 10, 6);
+}
+
+function drawMonster(m) {
+  // Purple body: round top and a wavy bottom edge
+  ctx.fillStyle = '#8e2de2';
+  ctx.beginPath();
+  ctx.arc(m.x + 18, m.y + 16, 18, Math.PI, 0);
+  let px = m.x + 36;
+  for (let i = 0; i < 4; i++) {
+    ctx.quadraticCurveTo(px - 4.5, m.y + (i % 2 ? 26 : 38), px - 9, m.y + 32);
+    px -= 9;
+  }
+  ctx.closePath();
+  ctx.fill();
+
+  // Glowing yellow eyes
+  ctx.fillStyle = '#ffe600';
+  ctx.beginPath();
+  ctx.arc(m.x + 12, m.y + 14, 5, 0, Math.PI * 2);
+  ctx.arc(m.x + 24, m.y + 14, 5, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.fillStyle = '#000';
+  ctx.fillRect(m.x + 11, m.y + 13, 3, 3);
+  ctx.fillRect(m.x + 23, m.y + 13, 3, 3);
+
+  // Toothy mouth
+  ctx.fillStyle = '#300';
+  ctx.beginPath();
+  ctx.arc(m.x + 18, m.y + 26, 6, 0, Math.PI);
+  ctx.fill();
+  ctx.fillStyle = '#fff';
+  ctx.fillRect(m.x + 13, m.y + 26, 3, 3);
+  ctx.fillRect(m.x + 20, m.y + 26, 3, 3);
+}
+
+function drawFlag(o) {
+  ctx.fillStyle = '#ddd';
+  ctx.fillRect(o.x, o.y, 4, FLOOR_Y - flag.top);
+  ctx.beginPath();
+  ctx.arc(o.x + 2, o.y, 5, 0, Math.PI * 2);
+  ctx.fill();
+
+  ctx.fillStyle = '#2ecc40';
+  ctx.beginPath();
+  ctx.moveTo(o.x + 4, o.y + 4);
+  ctx.lineTo(o.x + 42, o.y + 18);
+  ctx.lineTo(o.x + 4, o.y + 32);
+  ctx.closePath();
+  ctx.fill();
+}
+
+function draw() {
+  eyeX = player.x + player.w / 2;
+  eyeY = player.y - 10;
+
+  // Sky above the horizon, dark void below it (visible through gaps)
+  const sky = ctx.createLinearGradient(0, 0, 0, HORIZON);
+  sky.addColorStop(0, '#4a86e8');
+  sky.addColorStop(1, '#b8e2ff');
+  ctx.fillStyle = sky;
+  ctx.fillRect(0, 0, W, HORIZON);
+  const void_ = ctx.createLinearGradient(0, HORIZON, 0, H);
+  void_.addColorStop(0, '#2a2a55');
+  void_.addColorStop(1, '#0b0b1e');
+  ctx.fillStyle = void_;
+  ctx.fillRect(0, HORIZON, W, H - HORIZON);
+
+  // Painter's algorithm: draw the farthest things first
+  const items = [];
+  for (const s of platforms) items.push({ key: s.x + s.w, draw: () => drawSlab(s) });
+  for (const e of enemies) if (e.alive) items.push({ key: e.x, draw: () => drawSprite(e, e.w, drawGoomba) });
+  for (const m of monsters) items.push({ key: m.x, draw: () => drawSprite(m, m.w, drawMonster) });
+  items.push({ key: flag.x, draw: () => drawSprite({ x: flag.x, y: flag.top }, 4, drawFlag) });
+  items.sort((a, b) => b.key - a.key);
+  for (const item of items) item.draw();
+
+  // Crosshair
+  ctx.strokeStyle = 'rgba(255, 255, 255, 0.7)';
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.moveTo(W / 2 - 8, H / 2);
+  ctx.lineTo(W / 2 + 8, H / 2);
+  ctx.moveTo(W / 2, H / 2 - 8);
+  ctx.lineTo(W / 2, H / 2 + 8);
+  ctx.stroke();
+
+  if (won) {
+    ctx.fillStyle = '#fff';
+    ctx.font = 'bold 32px sans-serif';
+    ctx.textAlign = 'center';
+    ctx.shadowColor = 'rgba(0, 0, 0, 0.5)';
+    ctx.shadowBlur = 8;
+    ctx.fillText('CLEAR! R 키로 다시 시작', W / 2, H / 2 - 30);
+    ctx.shadowBlur = 0;
+  }
+}
+
+function loop() {
+  update();
+  draw();
+  requestAnimationFrame(loop);
+}
+
+reset();
+loop();
+</script>
+</body>
+</html>

@@ -1,0 +1,351 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Jump Game</title>
+<style>
+  body { margin: 0; min-height: 100vh; display: flex; flex-direction: column; align-items: center; justify-content: center; background: #222; font-family: sans-serif; color: #eee; }
+  canvas { max-width: 100%; height: auto; border: 4px solid #000; background: #5c94fc; }
+  p { font-size: 14px; text-align: center; padding: 0 16px; }
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+<p>← → / A D 이동 · Space / ↑ / W 점프 · 적을 위에서 밟기 · 깃발에 닿으면 클리어 · R 다시 시작</p>
+<script>
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+const W = 800;
+const H = 450;
+
+// Render at device pixel ratio so the image stays sharp on retina screens
+const dpr = window.devicePixelRatio || 1;
+canvas.width = W * dpr;
+canvas.height = H * dpr;
+ctx.scale(dpr, dpr);
+
+const GRAVITY = 0.6;
+const JUMP_POWER = -12;
+const MOVE_SPEED = 4;
+const WORLD_WIDTH = 2450;
+const FLOOR_Y = 400;
+
+const keys = {};
+addEventListener('keydown', e => {
+  keys[e.code] = true;
+  if (['Space', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight'].includes(e.code)) e.preventDefault();
+});
+addEventListener('keyup', e => { keys[e.code] = false; });
+
+const platforms = [
+  { x: 0, y: FLOOR_Y, w: 600, h: 50 },
+  { x: 680, y: FLOOR_Y, w: 500, h: 50 },
+  { x: 1260, y: FLOOR_Y, w: 400, h: 50 },
+  { x: 1750, y: FLOOR_Y, w: 700, h: 50 },
+  { x: 330, y: 320, w: 120, h: 20 },
+  { x: 800, y: 300, w: 140, h: 20 },
+  { x: 1040, y: 340, w: 100, h: 20 },
+  { x: 1460, y: 300, w: 150, h: 20 },
+  { x: 1900, y: 330, w: 120, h: 20 },
+];
+const flag = { x: 2360, top: 300 };
+
+// Background decoration in world coordinates
+const CLOUDS = [[120, 70], [420, 50], [760, 90], [1100, 60], [1500, 80], [1880, 55], [2250, 85]];
+const HILLS = [[150, 90], [700, 120], [1300, 80], [1900, 110], [2300, 90]];
+
+// Enemies patrol between min and max; they are not affected by gravity.
+function makeEnemies() {
+  return [
+    { x: 300, y: 368, w: 28, h: 32, dir: -1, min: 150, max: 560, alive: true },
+    { x: 900, y: 268, w: 28, h: 32, dir: 1, min: 800, max: 912, alive: true },
+    { x: 1800, y: 368, w: 28, h: 32, dir: 1, min: 1760, max: 2050, alive: true },
+    { x: 1500, y: 268, w: 28, h: 32, dir: -1, min: 1460, max: 1580, alive: true },
+  ];
+}
+
+// Floating monsters bob up and down and drift toward the player when near.
+function makeMonsters() {
+  return [
+    { x: 600, y: 180, baseY: 180, w: 36, h: 36, t: 0 },
+    { x: 1350, y: 150, baseY: 150, w: 36, h: 36, t: 2 },
+    { x: 2050, y: 200, baseY: 200, w: 36, h: 36, t: 4 },
+  ];
+}
+
+let player, enemies, monsters, cameraX, won;
+
+function reset() {
+  player = { x: 40, y: FLOOR_Y - 32, w: 28, h: 32, vx: 0, vy: 0, onGround: false };
+  enemies = makeEnemies();
+  monsters = makeMonsters();
+  won = false;
+}
+
+function hit(a, b) {
+  return a.x < b.x + b.w && a.x + a.w > b.x && a.y < b.y + b.h && a.y + a.h > b.y;
+}
+
+function update() {
+  if (keys.KeyR) { reset(); return; }
+  if (won) return;
+
+  const left = keys.ArrowLeft || keys.KeyA;
+  const right = keys.ArrowRight || keys.KeyD;
+  const jump = keys.Space || keys.ArrowUp || keys.KeyW;
+  const p = player;
+
+  p.vx = ((right ? 1 : 0) - (left ? 1 : 0)) * MOVE_SPEED;
+  if (jump && p.onGround) { p.vy = JUMP_POWER; p.onGround = false; }
+  p.vy = Math.min(p.vy + GRAVITY, 14);
+
+  // Horizontal move, then resolve against platform sides
+  p.x = Math.max(0, Math.min(WORLD_WIDTH - p.w, p.x + p.vx));
+  for (const s of platforms) {
+    if (!hit(p, s)) continue;
+    if (p.vx > 0) p.x = s.x - p.w;
+    else if (p.vx < 0) p.x = s.x + s.w;
+  }
+
+  // Vertical move, then resolve against platform tops and bottoms
+  p.y += p.vy;
+  p.onGround = false;
+  for (const s of platforms) {
+    if (!hit(p, s)) continue;
+    if (p.vy > 0) { p.y = s.y - p.h; p.onGround = true; }
+    else if (p.vy < 0) p.y = s.y + s.h;
+    p.vy = 0;
+  }
+
+  if (p.y > H + 100) { reset(); return; }
+
+  for (const e of enemies) {
+    if (!e.alive) continue;
+    e.x += e.dir * 1.2;
+    if (e.x < e.min || e.x > e.max) e.dir *= -1;
+    if (!hit(p, e)) continue;
+    const wasAbove = p.y + p.h - p.vy <= e.y + 6;
+    if (p.vy > 0 && wasAbove) {
+      e.alive = false;
+      p.vy = JUMP_POWER * 0.6;
+    } else {
+      reset();
+      return;
+    }
+  }
+
+  for (const m of monsters) {
+    m.t += 0.05;
+    m.y = m.baseY + Math.sin(m.t) * 30;
+    if (Math.abs(p.x - m.x) < 320) m.x += Math.sign(p.x - m.x) * 0.9;
+    if (hit(p, m)) { reset(); return; }
+  }
+
+  if (p.x + p.w > flag.x) won = true;
+}
+
+function drawCloud(x, y) {
+  ctx.fillStyle = '#fff';
+  ctx.beginPath();
+  ctx.arc(x, y, 18, 0, Math.PI * 2);
+  ctx.arc(x + 22, y - 8, 22, 0, Math.PI * 2);
+  ctx.arc(x + 46, y, 18, 0, Math.PI * 2);
+  ctx.fill();
+}
+
+function drawHill(x, r) {
+  ctx.fillStyle = '#3c9c3c';
+  ctx.beginPath();
+  ctx.arc(x, FLOOR_Y, r, Math.PI, 0);
+  ctx.fill();
+}
+
+function drawBlock(s) {
+  const grad = ctx.createLinearGradient(0, s.y, 0, s.y + s.h);
+  grad.addColorStop(0, '#e8803c');
+  grad.addColorStop(1, '#a03c0c');
+  ctx.fillStyle = grad;
+  ctx.fillRect(s.x, s.y, s.w, s.h);
+
+  // Brick seams
+  ctx.strokeStyle = 'rgba(60, 20, 0, 0.5)';
+  ctx.lineWidth = 2;
+  for (let by = s.y + 10; by < s.y + s.h; by += 10) {
+    ctx.beginPath();
+    ctx.moveTo(s.x, by);
+    ctx.lineTo(s.x + s.w, by);
+    ctx.stroke();
+  }
+
+  // Grass top
+  ctx.fillStyle = '#5cd45c';
+  ctx.fillRect(s.x, s.y, s.w, 6);
+  ctx.fillStyle = '#1e7a1e';
+  ctx.fillRect(s.x, s.y + 6, s.w, 2);
+}
+
+function drawGoomba(e) {
+  // Body
+  ctx.fillStyle = '#8b4a1e';
+  ctx.beginPath();
+  ctx.ellipse(e.x + 14, e.y + 14, 14, 14, 0, 0, Math.PI * 2);
+  ctx.fill();
+
+  // Lighter lower face
+  ctx.fillStyle = '#f3d9a4';
+  ctx.beginPath();
+  ctx.ellipse(e.x + 14, e.y + 22, 10, 6, 0, 0, Math.PI * 2);
+  ctx.fill();
+
+  // Eyes with angry brows
+  ctx.fillStyle = '#fff';
+  ctx.fillRect(e.x + 6, e.y + 9, 6, 7);
+  ctx.fillRect(e.x + 16, e.y + 9, 6, 7);
+  ctx.fillStyle = '#000';
+  ctx.fillRect(e.x + 8, e.y + 11, 3, 4);
+  ctx.fillRect(e.x + 18, e.y + 11, 3, 4);
+  ctx.strokeStyle = '#000';
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.moveTo(e.x + 5, e.y + 7);
+  ctx.lineTo(e.x + 12, e.y + 9);
+  ctx.moveTo(e.x + 23, e.y + 7);
+  ctx.lineTo(e.x + 16, e.y + 9);
+  ctx.stroke();
+
+  // Feet
+  ctx.fillStyle = '#3a1f0a';
+  ctx.fillRect(e.x + 2, e.y + 26, 10, 6);
+  ctx.fillRect(e.x + 16, e.y + 26, 10, 6);
+}
+
+function drawPlayer(p) {
+  const x = p.x;
+  const y = p.y;
+
+  // Chibi proportions: a big head (about a third of the height) and a short body
+
+  // Red cap with brim
+  ctx.fillStyle = '#e52521';
+  ctx.fillRect(x + 4, y, 20, 5);
+  ctx.fillRect(x + 1, y + 3, 8, 3);
+
+  // Big face
+  ctx.fillStyle = '#ffcc99';
+  ctx.fillRect(x + 4, y + 5, 20, 8);
+  ctx.fillStyle = '#000';
+  ctx.fillRect(x + 16, y + 7, 3, 3);
+  ctx.fillStyle = '#4a2a00';
+  ctx.fillRect(x + 12, y + 10, 7, 2);
+
+  // Red shirt
+  ctx.fillStyle = '#e52521';
+  ctx.fillRect(x + 3, y + 13, 22, 5);
+
+  // Blue overalls and legs
+  ctx.fillStyle = '#2050c0';
+  ctx.fillRect(x + 5, y + 18, 18, 6);
+  ctx.fillRect(x + 5, y + 24, 6, 4);
+  ctx.fillRect(x + 17, y + 24, 6, 4);
+
+  // Brown shoes
+  ctx.fillStyle = '#5c2e00';
+  ctx.fillRect(x + 2, y + 28, 10, 4);
+  ctx.fillRect(x + 16, y + 28, 10, 4);
+}
+
+function drawMonster(m) {
+  // Purple body: round top and a wavy bottom edge
+  ctx.fillStyle = '#8e2de2';
+  ctx.beginPath();
+  ctx.arc(m.x + 18, m.y + 16, 18, Math.PI, 0);
+  let px = m.x + 36;
+  for (let i = 0; i < 4; i++) {
+    ctx.quadraticCurveTo(px - 4.5, m.y + (i % 2 ? 26 : 38), px - 9, m.y + 32);
+    px -= 9;
+  }
+  ctx.closePath();
+  ctx.fill();
+
+  // Glowing yellow eyes
+  ctx.fillStyle = '#ffe600';
+  ctx.beginPath();
+  ctx.arc(m.x + 12, m.y + 14, 5, 0, Math.PI * 2);
+  ctx.arc(m.x + 24, m.y + 14, 5, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.fillStyle = '#000';
+  ctx.fillRect(m.x + 11, m.y + 13, 3, 3);
+  ctx.fillRect(m.x + 23, m.y + 13, 3, 3);
+
+  // Toothy mouth
+  ctx.fillStyle = '#300';
+  ctx.beginPath();
+  ctx.arc(m.x + 18, m.y + 26, 6, 0, Math.PI);
+  ctx.fill();
+  ctx.fillStyle = '#fff';
+  ctx.fillRect(m.x + 13, m.y + 26, 3, 3);
+  ctx.fillRect(m.x + 20, m.y + 26, 3, 3);
+}
+
+function drawFlag() {
+  ctx.fillStyle = '#ddd';
+  ctx.fillRect(flag.x, flag.top, 4, FLOOR_Y - flag.top);
+  ctx.beginPath();
+  ctx.arc(flag.x + 2, flag.top, 5, 0, Math.PI * 2);
+  ctx.fill();
+
+  ctx.fillStyle = '#2ecc40';
+  ctx.beginPath();
+  ctx.moveTo(flag.x + 4, flag.top + 4);
+  ctx.lineTo(flag.x + 42, flag.top + 18);
+  ctx.lineTo(flag.x + 4, flag.top + 32);
+  ctx.closePath();
+  ctx.fill();
+}
+
+function draw() {
+  cameraX = Math.max(0, Math.min(WORLD_WIDTH - W, player.x - W / 3));
+
+  // Sky gradient
+  const sky = ctx.createLinearGradient(0, 0, 0, H);
+  sky.addColorStop(0, '#4a86e8');
+  sky.addColorStop(1, '#b8e2ff');
+  ctx.fillStyle = sky;
+  ctx.fillRect(0, 0, W, H);
+
+  ctx.save();
+  ctx.translate(-cameraX, 0);
+
+  for (const [x, y] of CLOUDS) drawCloud(x, y);
+  for (const [x, r] of HILLS) drawHill(x, r);
+  for (const s of platforms) drawBlock(s);
+  for (const e of enemies) if (e.alive) drawGoomba(e);
+  for (const m of monsters) drawMonster(m);
+  drawFlag();
+  drawPlayer(player);
+
+  ctx.restore();
+
+  if (won) {
+    ctx.fillStyle = '#fff';
+    ctx.font = 'bold 32px sans-serif';
+    ctx.textAlign = 'center';
+    ctx.shadowColor = 'rgba(0, 0, 0, 0.5)';
+    ctx.shadowBlur = 8;
+    ctx.fillText('CLEAR! R 키로 다시 시작', W / 2, H / 2);
+    ctx.shadowBlur = 0;
+  }
+}
+
+function loop() {
+  update();
+  draw();
+  requestAnimationFrame(loop);
+}
+
+reset();
+loop();
+</script>
+</body>
+</html>
