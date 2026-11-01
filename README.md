@@ -1,5 +1,7 @@
 # JTW1
 
+![JTW1](.github/banner.jpg)
+
 파일 기반 계획 워크플로우([ahastudio/file-based-planning-workflow](https://github.com/ahastudio/file-based-planning-workflow))를 따르는 점프 게임 실습 저장소입니다.
 
 ## 워크플로우
